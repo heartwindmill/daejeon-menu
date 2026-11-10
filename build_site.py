@@ -10,7 +10,9 @@ GitHub Actions가 매일 실행하고, GitHub Pages가 docs/ 폴더를 공개한
 
 import hashlib
 import html
-import shutil
+import re
+import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -21,7 +23,6 @@ GBMO = "https://www.gbmo.go.kr"
 DIET_API = f"{GBMO}/chungsa/dv/dietView"
 DAEJEON = "CD003"  # 대전청사 코드
 SOURCE_PAGE = f"{DIET_API}/selectDietCalendarView.do?mi=1277&gbd={DAEJEON}"
-HEADERS = {"User-Agent": "Mozilla/5.0", "Content-Type": "application/json; charset=UTF-8"}
 KST = ZoneInfo("Asia/Seoul")
 WEEKDAYS = "월화수목금토일"
 
@@ -29,47 +30,116 @@ OUT = Path(__file__).resolve().parent / "docs"
 IMG_DIR = OUT / "img"
 
 
+# 식당 목록 조회가 막혔을 때 쓰는 기본 목록
+DEFAULT_RESTAURANTS = [("1049", "1동, 2동"), ("1050", "3동, 4동"), ("1051", "양식당"), ("1052", "후생동 식당")]
+
+# 정부 사이트 보안장비가 연속 요청을 끊는 경우가 있어 브라우저처럼 보이게 하고 간격을 둔다
+session = requests.Session()
+session.headers.update({
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"),
+    "Accept-Language": "ko-KR,ko;q=0.9",
+    "Referer": SOURCE_PAGE,
+})
+
+
+def with_retry(func, what, tries=4):
+    for i in range(1, tries + 1):
+        try:
+            time.sleep(1.5)
+            return func()
+        except requests.RequestException as e:
+            print(f"  [{what}] {i}/{tries}회 실패: {e}")
+            if i == tries:
+                raise
+            time.sleep(5 * i)
+
+
 def post(path, **params):
-    r = requests.post(f"{DIET_API}/{path}", json={"sysId": "chungsa", "gbd": DAEJEON, **params},
-                      headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    def call():
+        r = session.post(f"{DIET_API}/{path}", json={"sysId": "chungsa", "gbd": DAEJEON, **params},
+                         headers={"Content-Type": "application/json; charset=UTF-8",
+                                  "Accept": "application/json, text/javascript, */*; q=0.01",
+                                  "X-Requested-With": "XMLHttpRequest", "Origin": GBMO},
+                         timeout=30)
+        r.raise_for_status()
+        return r.json()
+    return with_retry(call, path)
+
+
+def find_image_from_page(code):
+    """대체 경로: 일반 식단 페이지(HTML)에서 이미지 주소를 찾는다."""
+    def call():
+        r = session.get(f"{SOURCE_PAGE}&rc={code}", timeout=30)
+        r.raise_for_status()
+        return r.text
+    m = re.search(r'<img src="(/NAS/jboss/uploads/chungsa/di/[^"]+)" data-id="diet"', with_retry(call, f"page {code}"))
+    return m.group(1) if m else None
+
+
+def get_restaurants():
+    try:
+        return [(r["rstrntCode"], r["rstrntName"]) for r in post("selectRstrntList.do")]
+    except requests.RequestException:
+        print("식당 목록 조회 실패 → 기본 목록 사용")
+        return DEFAULT_RESTAURANTS
+
+
+def fetch_menu(code, name):
+    """식당 1곳의 최신 식단 이미지. 조회 API → 실패 시 일반 페이지 순서로 시도."""
+    path, ext, week = None, None, None
+    try:
+        result = post("selectDietView.do", rc=code)
+        if not result:
+            return {"code": code, "name": name, "status": "empty"}
+        d = result[0]
+        path, ext = d["fileStreCours"], (d.get("fileExtsn") or "").lower()
+        week = datetime.fromtimestamp(d["dietDate"] / 1000, KST)
+    except requests.RequestException:
+        print(f"  {name}: 조회 API 실패 → 일반 페이지에서 찾기")
+        path = find_image_from_page(code)
+        if not path:
+            return {"code": code, "name": name, "status": "empty"}
+
+    ext = ext or path.rsplit(".", 1)[-1].lower()
+    img = with_retry(lambda: session.get(GBMO + path, timeout=60), f"image {code}")
+    img.raise_for_status()
+    return {"code": code, "name": name, "ext": ext, "bytes": img.content, "week": week, "status": "ok"}
 
 
 def fetch_menus():
-    """대전청사 식당별 최신 식단 정보 + 이미지 바이트."""
     menus = []
-    for r in post("selectRstrntList.do"):
-        code, name = r["rstrntCode"], r["rstrntName"]
-        result = post("selectDietView.do", rc=code)
-        if not result:
-            menus.append({"code": code, "name": name})
-            continue
-        d = result[0]
-        img = requests.get(GBMO + d["fileStreCours"], headers={"User-Agent": "Mozilla/5.0"}, timeout=60)
-        img.raise_for_status()
-        menus.append({
-            "code": code,
-            "name": name,
-            "ext": (d.get("fileExtsn") or "jpg").lower(),
-            "bytes": img.content,
-            "week": datetime.fromtimestamp(d["dietDate"] / 1000, KST),
-        })
+    for code, name in get_restaurants():
+        try:
+            menus.append(fetch_menu(code, name))
+        except requests.RequestException as e:
+            print(f"  {name}: 가져오기 실패 ({e}) → 이전 식단 유지")
+            menus.append({"code": code, "name": name, "status": "failed"})
     return menus
 
 
 def write_images(menus):
-    """이미지를 docs/img/<식당코드>.<확장자> 로 저장 (이전 파일은 정리)."""
-    if IMG_DIR.exists():
-        shutil.rmtree(IMG_DIR)
-    IMG_DIR.mkdir(parents=True)
+    """이미지를 docs/img/<식당코드>.<확장자> 로 저장. 이번에 못 받은 식당은 이전 파일 유지."""
+    IMG_DIR.mkdir(parents=True, exist_ok=True)
+    keep = set()
     for m in menus:
-        if "bytes" not in m:
+        if m["status"] == "ok":
+            fname = f"{m['code']}.{m['ext']}"
+            (IMG_DIR / fname).write_bytes(m["bytes"])
+        elif m["status"] == "failed":
+            old = sorted(IMG_DIR.glob(f"{m['code']}.*"))
+            if not old:
+                continue
+            fname = old[0].name
+            m["bytes"] = old[0].read_bytes()
+        else:
             continue
-        fname = f"{m['code']}.{m['ext']}"
-        (IMG_DIR / fname).write_bytes(m["bytes"])
+        keep.add(fname)
         # 이미지가 바뀌면 주소도 바뀌게 해서 휴대폰 캐시에 옛 식단이 남지 않도록
         m["src"] = f"img/{fname}?v={hashlib.md5(m['bytes']).hexdigest()[:8]}"
+    for f in IMG_DIR.iterdir():
+        if f.name not in keep:
+            f.unlink()
 
 
 def render(menus):
@@ -83,7 +153,9 @@ def render(menus):
             body = (f'<a href="{m["src"]}" target="_blank" rel="noopener" class="img-link">'
                     f'<img src="{m["src"]}" alt="{name} 주간 식단표" loading="lazy"></a>'
                     f'<a class="open" href="{m["src"]}" target="_blank" rel="noopener">원본 크게 보기 ↗</a>')
-            week = f'{m["week"]:%m/%d}({WEEKDAYS[m["week"].weekday()]}) 주'
+            week = f'{m["week"]:%m/%d}({WEEKDAYS[m["week"].weekday()]}) 주' if m.get("week") else ""
+            if m["status"] == "failed":
+                week = "⚠ 오늘 갱신 실패 · 이전 식단"
         else:
             body = '<p class="empty">등록된 식단이 없습니다.</p>'
             week = ""
@@ -152,6 +224,9 @@ def render(menus):
 
 def main():
     menus = fetch_menus()
+    if all(m["status"] == "failed" for m in menus):
+        # 전부 실패하면 기존 페이지를 건드리지 않고 실패로 끝낸다 (Actions에 빨간 X 표시)
+        sys.exit("모든 식당 식단을 가져오지 못했습니다. 기존 페이지를 유지합니다.")
     OUT.mkdir(exist_ok=True)
     write_images(menus)
     (OUT / "index.html").write_text(render(menus), encoding="utf-8")
