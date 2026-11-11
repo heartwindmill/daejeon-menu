@@ -10,6 +10,8 @@ GitHub Actions가 매일 실행하고, GitHub Pages가 docs/ 폴더를 공개한
 
 import hashlib
 import html
+import json
+import os
 import re
 import sys
 import time
@@ -28,6 +30,7 @@ WEEKDAYS = "월화수목금토일"
 
 OUT = Path(__file__).resolve().parent / "docs"
 IMG_DIR = OUT / "img"
+STATUS_FILE = OUT / "status.json"  # 오늘 갱신 성공 여부 (10시 재실행이 확인용으로 읽음)
 
 
 # 식당 목록 조회가 막혔을 때 쓰는 기본 목록
@@ -93,13 +96,16 @@ def fetch_menu(code, name):
         if not result:
             return {"code": code, "name": name, "status": "empty"}
         d = result[0]
-        path, ext = d["fileStreCours"], (d.get("fileExtsn") or "").lower()
-        week = datetime.fromtimestamp(d["dietDate"] / 1000, KST)
-    except requests.RequestException:
+        path, ext = d.get("fileStreCours"), (d.get("fileExtsn") or "").lower()
+        if d.get("dietDate"):
+            week = datetime.fromtimestamp(d["dietDate"] / 1000, KST)
+    except (requests.RequestException, ValueError, KeyError, TypeError, IndexError):
         print(f"  {name}: 조회 API 실패 → 일반 페이지에서 찾기")
         path = find_image_from_page(code)
         if not path:
             return {"code": code, "name": name, "status": "empty"}
+    if not path:  # 조회는 됐는데 이미지 주소가 아직 없음 = 식단이 덜 올라옴
+        raise ValueError("식단 이미지 주소가 비어 있음")
 
     ext = ext or path.rsplit(".", 1)[-1].lower()
     img = with_retry(lambda: session.get(GBMO + path, timeout=60), f"image {code}")
@@ -112,7 +118,7 @@ def fetch_menus():
     for code, name in get_restaurants():
         try:
             menus.append(fetch_menu(code, name))
-        except requests.RequestException as e:
+        except Exception as e:  # 어떤 오류든 이 식당만 실패 처리하고 나머지는 계속
             print(f"  {name}: 가져오기 실패 ({e}) → 이전 식단 유지")
             menus.append({"code": code, "name": name, "status": "failed"})
     return menus
@@ -142,8 +148,14 @@ def write_images(menus):
             f.unlink()
 
 
-def render(menus):
+def render(menus, retry_later):
     now = datetime.now(KST)
+    failed = sum(m["status"] == "failed" for m in menus)
+    banner = ""
+    if failed:
+        what = "갱신 실패" if failed == len(menus) else f"{failed}곳 갱신 실패"
+        plan = "10시에 다시 시도합니다" if retry_later else "이전 식단을 표시 중입니다"
+        banner = f'<p class="fail">⚠ {now:%H:%M} {what} · {plan}</p>'
     chips, cards = [], []
     for m in menus:
         name = html.escape(m["name"])
@@ -190,6 +202,8 @@ def render(menus):
   @media (prefers-color-scheme: dark) {{ header {{ background: #1f2f66; }} }}
   header h1 {{ margin: 0 0 4px; font-size: 1.35rem; }}
   header p {{ margin: 0; font-size: .85rem; opacity: .85; }}
+  header p.fail {{ display: inline-block; margin-top: 8px; padding: 5px 10px; border-radius: 8px;
+                  background: #ffe2e0; color: #b42318; opacity: 1; font-weight: 700; }}
   nav {{ position: sticky; top: 0; z-index: 1; display: flex; gap: 8px; overflow-x: auto;
         padding: 10px 16px; background: var(--bg); border-bottom: 1px solid var(--line); }}
   .chip {{ flex: none; padding: 7px 14px; border-radius: 999px; background: var(--chip);
@@ -210,7 +224,8 @@ def render(menus):
 <body>
 <header>
   <h1>🍱 정부대전청사 구내식당 식단표</h1>
-  <p>마지막 확인 {now:%Y.%m.%d}({WEEKDAYS[now.weekday()]}) {now:%H:%M} · 평일 아침 자동 갱신</p>
+  <p>마지막 확인 {now:%Y.%m.%d}({WEEKDAYS[now.weekday()]}) {now:%H:%M} · 평일 9시 자동 갱신</p>
+  {banner}
 </header>
 <nav>{"".join(chips)}</nav>
 <main>{"".join(cards)}
@@ -223,16 +238,22 @@ def render(menus):
 
 
 def main():
+    # RETRY_LATER=1 이면 실패 시 "10시에 다시 시도" 문구 표시 (워크플로의 9시 실행이 설정)
+    retry_later = os.environ.get("RETRY_LATER") == "1"
     menus = fetch_menus()
-    if all(m["status"] == "failed" for m in menus):
-        # 전부 실패하면 기존 페이지를 건드리지 않고 실패로 끝낸다 (Actions에 빨간 X 표시)
-        sys.exit("모든 식당 식단을 가져오지 못했습니다. 기존 페이지를 유지합니다.")
     OUT.mkdir(exist_ok=True)
-    write_images(menus)
-    (OUT / "index.html").write_text(render(menus), encoding="utf-8")
+    write_images(menus)  # 실패한 식당은 이전 이미지 유지
+    (OUT / "index.html").write_text(render(menus, retry_later), encoding="utf-8")
     (OUT / ".nojekyll").touch()  # GitHub Pages가 파일을 그대로 공개하도록
+    ok = not any(m["status"] == "failed" for m in menus)
+    now = datetime.now(KST)
+    STATUS_FILE.write_text(json.dumps({"date": f"{now:%Y-%m-%d}", "time": f"{now:%H:%M}", "ok": ok},
+                                      ensure_ascii=False), encoding="utf-8")
     for m in menus:
-        print(f"{m['name']}: {'OK ' + m['src'] if 'src' in m else '식단 없음'}")
+        print(f"{m['name']}: {'OK ' + m['src'] if 'src' in m else ('실패' if m['status'] == 'failed' else '식단 없음')}")
+    if not ok:
+        # 페이지에는 실패 표시를 남기고, Actions에는 빨간 X로 알린다
+        sys.exit("일부 또는 전체 식당 식단을 가져오지 못했습니다.")
 
 
 if __name__ == "__main__":
