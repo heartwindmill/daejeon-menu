@@ -23,6 +23,8 @@
   @media (prefers-color-scheme: dark) { header { background: #1f2f66; } }
   header h1 { margin: 0 0 4px; font-size: 1.35rem; }
   header p { margin: 0; font-size: .85rem; opacity: .85; }
+  header p.fail { display: inline-block; margin-top: 8px; padding: 5px 10px; border-radius: 8px;
+                  background: #ffe2e0; color: #b42318; opacity: 1; font-weight: 700; }
   nav { position: sticky; top: 0; z-index: 1; display: flex; gap: 8px; overflow-x: auto;
         padding: 10px 16px; background: var(--bg); border-bottom: 1px solid var(--line); }
   .chip { flex: none; padding: 7px 14px; border-radius: 999px; background: var(--chip);
@@ -43,7 +45,8 @@
 <body>
 <header>
   <h1>🍱 정부대전청사 구내식당 식단표</h1>
-  <p>마지막 확인 2026.11.11(수) 16:03 · 평일 아침 자동 갱신</p>
+  <p>마지막 확인 2026.11.12(목) 09:55 · 평일 9시 자동 갱신</p>
+  
 </header>
 <nav><a class="chip" href="#r1049">1동, 2동</a><a class="chip" href="#r1050">3동, 4동</a><a class="chip" href="#r1051">양식당</a><a class="chip" href="#r1052">후생동 식당</a></nav>
 <main>
